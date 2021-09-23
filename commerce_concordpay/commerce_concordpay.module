@@ -1,0 +1,301 @@
+<?php
+
+/**
+ * @file
+ * Module implementing a ConcordPay Gateway
+ */
+
+include_once(__DIR__ . '/commerce_concordpay.api.php');
+
+const COMMERCE_CONCORDPAY_APPROVE_URL  = 'commerce/concordpay/success';
+const COMMERCE_CONCORDPAY_DECLINE_URL  = 'commerce/concordpay/fail';
+const COMMERCE_CONCORDPAY_CANCEL_URL   = 'commerce/concordpay/cancel';
+const COMMERCE_CONCORDPAY_CALLBACK_URL = 'commerce/concordpay/callback';
+
+/**
+ * Implements hook menu().
+ *
+ * @return array
+ */
+function commerce_concordpay_menu()
+{
+  $items[COMMERCE_CONCORDPAY_CALLBACK_URL] = [
+    'page callback'    => 'commerce_concordpay_callback',
+    'access arguments' => ['access content'],
+    'type'             => MENU_CALLBACK,
+    'file'             => 'commerce_concordpay.pages.inc',
+
+    // This is a server-server communication page.
+    'access callback' => TRUE,
+  ];
+
+  // Payer will be redirected to this page after the payment.
+  $items[COMMERCE_CONCORDPAY_APPROVE_URL] = [
+    'title'            => t('Successful payment'),
+    'page callback'    => 'commerce_concordpay_success',
+    'access arguments' => ['access content'],
+    'type'             => MENU_CALLBACK,
+    'file'             => 'commerce_concordpay.pages.inc',
+  ];
+
+  $items[COMMERCE_CONCORDPAY_DECLINE_URL] = [
+    'title'            => t('Unsuccessful payment'),
+    'page callback'    => 'commerce_concordpay_fail',
+    'access arguments' => ['access content'],
+    'type'             => MENU_CALLBACK,
+    'file'             => 'commerce_concordpay.pages.inc',
+  ];
+
+  $items[COMMERCE_CONCORDPAY_CANCEL_URL] = [
+    'title'            => t('Canceled payment'),
+    'page callback'    => 'commerce_concordpay_cancel',
+    'access arguments' => ['access content'],
+    'type'             => MENU_CALLBACK,
+    'file'             => 'commerce_concordpay.pages.inc',
+  ];
+
+  return $items;
+}
+
+/**
+ * Implements hook_commerce_payment_method_info().
+ *
+ * @return array
+ */
+function commerce_concordpay_commerce_payment_method_info()
+{
+  return [
+    'commerce_concordpay' => [
+      'title'                => t('ConcordPay'),
+      'description'          => t('ConcordPay - Payment Visa, Mastercard, Google Pay, Apple Pay'),
+      'terminal'             => FALSE,
+      'offsite'              => TRUE,
+      'offsite_autoredirect' => TRUE,
+      'active'               => TRUE
+    ],
+  ];
+}
+
+/**
+ * Payment method settings form.
+ */
+function commerce_concordpay_settings_form($settings = NULL)
+{
+  $languages = [
+    'RU' => 'RU',
+    'UA' => 'UA',
+    'EN' => 'EN',
+  ];
+
+  $form['merchant_id'] = [
+    '#type'          => 'textfield',
+    '#title'         => t('Merchant ID'),
+    '#default_value' => $settings['merchant_id'] ?? '',
+    '#description'   => t('Given to Merchant by ConcordPay'),
+    '#size'          => 40,
+    '#maxlength'     => 150,
+    '#required'      => TRUE,
+  ];
+
+  $form['secret_key'] = [
+    '#type'          => 'textfield',
+    '#title'         => t('Secret key'),
+    '#default_value' => $settings['secret_key'] ?? '',
+    '#description'   => t('Given to Merchant by ConcordPay'),
+    '#size'          => 40,
+    '#maxlength'     => 100,
+    '#required'      => TRUE,
+  ];
+
+  $form['language'] = [
+    '#type'          => 'select',
+    '#title'         => t('Language'),
+    '#default_value' => $settings['language'] ?? 'RU',
+    '#description'   => t("Choose language of payment page"),
+    '#options'       => $languages,
+    '#required'      => FALSE,
+  ];
+
+  $form['token_tree'] = [
+    '#theme'       => 'token_tree',
+    '#token_types' => ['commerce-order'],
+    '#dialog'      => TRUE,
+  ];
+
+  return $form;
+}
+
+/**
+ * Payment method checkout form.
+ */
+function commerce_concordpay_submit_form($payment_method, $pane_values, $checkout_pane, $order)
+{
+  $form = [];
+
+  $form['image'] = [
+    '#theme'      => 'image',
+    '#path'       => drupal_get_path('module', 'commerce_concordpay') . '/images/concordpay.svg',
+    '#alt'        => t('ConcordPay'),
+    '#attributes' => [
+      'class' => ['commerce-concordpay-logo'],
+    ],
+  ];
+
+  $form['desc'] = [
+    '#prefix' => '<div class="commerce-concordpay-payment-description">',
+    '#suffix' => '</div>',
+    '#markup' => $payment_method['description']
+  ];
+
+  // http://drupal.org/node/1705862
+  $form['dummy'] = [
+    '#type'  => 'hidden',
+    '#value' => 'dummy',
+  ];
+
+  return $form;
+}
+
+/**
+ * Payment method checkout form submission.
+ */
+function commerce_concordpay_submit_form_subimt($payment_method, $pane_form, $pane_values, $order, $charge)
+{
+  $order->data['commerce_concordpay'] = $pane_values;
+}
+
+/**
+ * Payment method redirect form.
+ */
+function commerce_concordpay_redirect_form($form, &$form_state, $order, $payment_method)
+{
+  global $base_url;
+
+  $concordpay    = new ConcordPay();
+  $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+  $currency_code = $order_wrapper->commerce_order_total->currency_code->value();
+
+  $amount = $order_wrapper->commerce_order_total->amount->value();
+  $amount = commerce_currency_amount_to_decimal($amount, $currency_code);
+
+  $billing_address = $order_wrapper->commerce_customer_billing->commerce_customer_address->value();
+
+  $description = t('Payment by card on the site') . ' ' . $base_url . ', ' .
+    ($billing_address['name_line'] ?? null) . '.';
+
+  $approve_url = url(COMMERCE_CONCORDPAY_APPROVE_URL, [
+    'query' => [
+      'redirect_key' => $order->data['payment_redirect_key'],
+      'order_id'     => $order->order_id,
+    ],
+    'absolute' => TRUE,
+  ]);
+
+  $decline_url = url(COMMERCE_CONCORDPAY_DECLINE_URL, [
+    'query' => [
+      'redirect_key' => $order->data['payment_redirect_key'],
+      'order_id'     => $order->order_id,
+    ],
+    'absolute' => TRUE,
+  ]);
+
+  $cancel_url = url(COMMERCE_CONCORDPAY_CANCEL_URL, [
+    'query' => [
+      'redirect_key' => $order->data['payment_redirect_key'],
+      'order_id'     => $order->order_id,
+    ],
+    'absolute' => TRUE,
+  ]);
+
+  $callback_url = url(COMMERCE_CONCORDPAY_CALLBACK_URL, ['absolute' => TRUE]);
+
+  $fields = [
+    'operation'    => 'Purchase',
+    'merchant_id'  => $payment_method['settings']['merchant_id'],
+    'order_id'     => $order->order_id . Concordpay::ORDER_SEPARATOR . time(),
+    'amount'       => $amount,
+    'currency_iso' => Concordpay::CURRENCY_UAH,
+    'description'  => $description,
+    'approve_url'  => $approve_url,
+    'decline_url'  => $decline_url,
+    'cancel_url'   => $cancel_url,
+    'callback_url' => $callback_url,
+    // Statistics.
+    'client_last_name'  => $billing_address['last_name'] ?? '',
+    'client_first_name' => $billing_address['first_name'] ?? '',
+    'email'             => $order->mail ?? '',
+    'phone'             => ''
+  ];
+
+  $fields['signature'] = $concordpay->getRequestSignature($fields);
+
+  $redirect_form = commerce_concordpay_redirect_form_generate($fields, Concordpay::URL);
+
+  return $redirect_form;
+}
+
+/**
+ * Helper function for redirect form build.
+ *
+ * @param array $data
+ *   An array containing the fields for redirect form.
+ *
+ * @param string $url
+ *   Reserved param for future purposes.
+ *
+ * @return array $form
+ *   An array contaning the form ready to submit.
+ */
+
+function commerce_concordpay_redirect_form_generate($data, $url = '')
+{
+  $form['#action'] = Concordpay::URL;
+  foreach ($data as $k => $v) {
+    if (!is_array($v)) {
+      $form[$k] = [
+        '#type' => 'hidden',
+        '#value' => $v
+      ];
+    } else {
+      $i = 0;
+      foreach ($v as $sk => $val) {
+        $form[$k . '[' . $sk . ']'] = [
+          '#type' => 'hidden',
+          '#value' => $val
+        ];
+      }
+    }
+  }
+
+  $form['actions'] = ['#type' => 'actions'];
+
+  $form['actions']['submit'] = [
+    '#type'  => 'submit',
+    '#value' => t('Pay via ConcordPay')
+  ];
+
+  return $form;
+}
+
+/**
+ * Save a new transaction.
+ *
+ * @param object $order
+ *   Order for which the transaction will be saved.
+ * @param object $order_wrapper
+ *   Order Wrapper for which the transaction will be saved.
+ */
+function commerce_concordpay_create_transaction($order, $order_wrapper)
+{
+  $transaction = commerce_payment_transaction_new('commerce_concordpay', $order->order_id);
+
+  $transaction->instance_id   = 'commerce_concordpay|commerce_payment_commerce_concordpay';
+  $transaction->amount        = $order_wrapper->commerce_order_total->amount->value();
+  $transaction->currency_code = $order_wrapper->commerce_order_total->currency_code->value();
+  $transaction->status        = COMMERCE_PAYMENT_STATUS_SUCCESS;
+  $transaction->message       = t('The payment has completed.');
+  $transaction->remote_id     = $order->payment_remote_id;
+  $transaction->remote_status = $order->payment_remote_status;
+
+  commerce_payment_transaction_save($transaction);
+}
